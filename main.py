@@ -5,7 +5,9 @@ import numpy as np
 import subprocess
 
 TOKEN = os.getenv('TOKEN')
-if not TOKEN:
+ALLOWED_USER_ID = os.getenv('ALLOWED_USER_ID')
+
+if not TOKEN or not ALLOWED_USER_ID:
     from config import TOKEN, ALLOWED_USER_ID
 
 bot = telebot.TeleBot(token=TOKEN)

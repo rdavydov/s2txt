@@ -1,11 +1,12 @@
 services:
   bot:
-    container_name: voicetelegrambot
+    container_name: s2txt
     build:
       context: .
       dockerfile: Dockerfile
-    image: voicetelegrambot:latest
+    image: s2txt:latest
     init: true
     environment:
       - PYTHONUNBUFFERED=0
       - TOKEN=${TOKEN}
+      - ALLOWED_USER_ID=${ALLOWED_USER_ID}

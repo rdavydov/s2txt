@@ -1,0 +1,11 @@
+services:
+  bot:
+    container_name: voicetelegrambot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: voicetelegrambot:latest
+    init: true
+    environment:
+      - PYTHONUNBUFFERED=0
+      - TOKEN=${TOKEN}

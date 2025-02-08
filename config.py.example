@@ -1,0 +1,31 @@
+import os
+
+# Токен и ID пользователя (заменить на свои значения)
+TOKEN = "your_token_here"
+ALLOWED_USER_ID = 123456789  # int, не строка
+
+# Параметры аудио
+AUDIO_SETTINGS = {
+    'chunk_duration': 30,  # длительность каждого куска в секундах
+    'sample_rate': 44100,  # частота дискретизации
+    'audio_codec': 'pcm_s16le'  # кодек для конвертации
+}
+
+# Настройки бота
+BOT_SETTINGS = {
+    'timeout': 60,
+    'long_polling_timeout': 70,
+    'reconnect_delay': 15,  # задержка перед переподключением при ошибках
+    'language': 'ru-RU'  # язык для распознавания речи
+}
+
+# Пути к директориям и файлам
+PATHS = {
+    'temp_audio': 'temp_audio',
+    'logs': 'logs',
+    'metrics': 'metrics'
+}
+
+# Создание необходимых директорий
+for path in PATHS.values():
+    os.makedirs(path, exist_ok=True)

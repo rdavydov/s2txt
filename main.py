@@ -47,14 +47,23 @@ apihelper.READ_TIMEOUT = 15
 TEMP_AUDIO_DIR = 'temp_audio'
 os.makedirs(TEMP_AUDIO_DIR, exist_ok=True)
 
-# Глобальная переменная для контроля работы
+# Глобальные переменные для контроля работы
 bot_running = True
+current_bot = None
 
 def signal_handler(signum, frame):
     """Обработчик сигналов для корректного завершения"""
-    global bot_running
+    global bot_running, current_bot
     logger.info("Получен сигнал завершения. Останавливаем бота...")
     bot_running = False
+    
+    # Принудительно останавливаем polling
+    if current_bot:
+        try:
+            current_bot.stop_polling()
+            logger.info("Polling остановлен")
+        except Exception as e:
+            logger.warning(f"Ошибка при остановке polling: {e}")
 
 # Регистрируем обработчики сигналов
 signal.signal(signal.SIGINT, signal_handler)
@@ -73,6 +82,9 @@ def cleanup_temp_files():
 
 def safe_api_call(func, *args, max_retries=3, **kwargs):
     """Безопасное выполнение API вызовов с повторными попытками"""
+    if not bot_running:
+        return None
+        
     for attempt in range(max_retries):
         try:
             return func(*args, **kwargs)
@@ -90,6 +102,9 @@ def safe_api_call(func, *args, max_retries=3, **kwargs):
 
 def split_audio_file(input_file, chunk_duration=30):
     """Разбивает аудиофайл на части с улучшенной обработкой ошибок"""
+    if not bot_running:
+        return []
+        
     try:
         # Получаем длительность файла с таймаутом
         result = subprocess.run([
@@ -109,6 +124,9 @@ def split_audio_file(input_file, chunk_duration=30):
 
         chunk_paths = []
         for start in np.arange(0, audio_duration, chunk_duration):
+            if not bot_running:
+                break
+                
             end = min(start + chunk_duration, audio_duration)
             chunk_filename = os.path.join(
                 TEMP_AUDIO_DIR,
@@ -144,57 +162,79 @@ def split_audio_file(input_file, chunk_duration=30):
 
 def run_bot():
     """Основная функция с улучшенной обработкой ошибок"""
-    global bot_running
+    global bot_running, current_bot
     
     restart_count = 0
     max_restarts = 5
     
     while bot_running and restart_count < max_restarts:
-        bot = None
+        current_bot = None
         try:
             logger.info(f"Инициализация бота (попытка {restart_count + 1})...")
-            bot = telebot.TeleBot(token=TOKEN, threaded=True)
+            current_bot = telebot.TeleBot(token=TOKEN, threaded=True)
             
-            @bot.message_handler(commands=['start', 'help'])
+            @current_bot.message_handler(commands=['start', 'help'])
             def send_welcome(message):
                 """Команды приветствия"""
+                if not bot_running:
+                    return
+                    
                 if message.from_user.id != ALLOWED_USER_ID:
-                    safe_api_call(bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
+                    safe_api_call(current_bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
                     return
                 
                 welcome_text = "👋 Бот для распознавания речи готов к работе!\n🗣️ Отправьте голосовое сообщение."
-                safe_api_call(bot.reply_to, message, welcome_text)
+                safe_api_call(current_bot.reply_to, message, welcome_text)
 
-            @bot.message_handler(func=lambda message: True, content_types=['text'])
+            @current_bot.message_handler(func=lambda message: True, content_types=['text'])
             def text_processing(message):
                 """Обработка текстовых сообщений"""
+                if not bot_running:
+                    return
+                    
                 if message.from_user.id != ALLOWED_USER_ID:
-                    safe_api_call(bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
+                    safe_api_call(current_bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
                     return
 
-                safe_api_call(bot.reply_to, message, '🗣️ Запишите голосовое сообщение, либо перешлите его мне.')
+                safe_api_call(current_bot.reply_to, message, '🗣️ Запишите голосовое сообщение, либо перешлите его мне.')
 
-            @bot.message_handler(content_types=['voice'])
+            @current_bot.message_handler(content_types=['voice'])
             def voice_processing(message):
                 """Обработка голосовых сообщений"""
+                if not bot_running:
+                    return
+                    
                 if message.from_user.id != ALLOWED_USER_ID:
-                    safe_api_call(bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
+                    safe_api_call(current_bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
                     return
 
                 # Обрабатываем в отдельном потоке чтобы не блокировать polling
-                threading.Thread(target=process_voice_in_thread, args=(bot, message), daemon=True).start()
+                threading.Thread(target=process_voice_in_thread, args=(current_bot, message), daemon=True).start()
 
             def process_voice_in_thread(bot, message):
                 """Обработка голосового сообщения в отдельном потоке"""
+                if not bot_running:
+                    return
+                    
                 ogg_filepath = None
                 wav_filepath = None
                 
                 try:
                     safe_api_call(bot.reply_to, message, '⌛ Подождите немного, я обрабатываю голосовое сообщение...')
 
+                    if not bot_running:
+                        return
+                        
                     file_id = message.voice.file_id
                     file_info = safe_api_call(bot.get_file, file_id)
+                    
+                    if not bot_running or not file_info:
+                        return
+                        
                     downloaded_file = safe_api_call(bot.download_file, file_info.file_path)
+                    
+                    if not bot_running or not downloaded_file:
+                        return
                     
                     # Уникальные имена файлов
                     timestamp = int(time.time())
@@ -203,6 +243,9 @@ def run_bot():
 
                     with open(ogg_filepath, 'wb') as new_file:
                         new_file.write(downloaded_file)
+
+                    if not bot_running:
+                        return
 
                     # Конвертация с таймаутом
                     result = subprocess.run([
@@ -217,17 +260,22 @@ def run_bot():
                     if result.returncode != 0:
                         raise Exception(f"Ошибка конвертации: {result.stderr.decode()}")
 
+                    if not bot_running:
+                        return
+
                     chunk_paths = split_audio_file(wav_filepath)
-                    if chunk_paths:
+                    if chunk_paths and bot_running:
                         process_recognition(bot, message, chunk_paths)
-                    else:
+                    elif bot_running:
                         safe_api_call(bot.reply_to, message, '⚠️ Не удалось обработать аудио файл.')
 
                 except subprocess.TimeoutExpired:
-                    safe_api_call(bot.reply_to, message, '⚠️ Превышено время обработки файла.')
+                    if bot_running:
+                        safe_api_call(bot.reply_to, message, '⚠️ Превышено время обработки файла.')
                     logger.error("Таймаут при конвертации")
                 except Exception as e:
-                    safe_api_call(bot.reply_to, message, f'⚠️ Ошибка при подготовке: {str(e)}')
+                    if bot_running:
+                        safe_api_call(bot.reply_to, message, f'⚠️ Ошибка при подготовке: {str(e)}')
                     logger.error(f"Ошибка обработки голосового сообщения: {e}")
                 finally:
                     # Удаляем временные файлы
@@ -240,6 +288,9 @@ def run_bot():
 
             def process_recognition(bot, message, chunk_paths):
                 """Распознавание речи с улучшенной обработкой"""
+                if not bot_running:
+                    return
+                    
                 recognizer = sr.Recognizer()
                 # Настройки для лучшего распознавания
                 recognizer.energy_threshold = 300
@@ -250,6 +301,9 @@ def run_bot():
 
                     recognized_texts = []
                     for i, chunk_path in enumerate(chunk_paths, 1):
+                        if not bot_running:
+                            break
+                            
                         try:
                             with sr.AudioFile(chunk_path) as source:
                                 # Настройка для устранения шума
@@ -259,15 +313,19 @@ def run_bot():
                                 chunk_text = recognizer.recognize_google(audio_data, language='ru-RU')
                                 if chunk_text.strip():
                                     recognized_texts.append(chunk_text)
-                                    safe_api_call(bot.send_message, message.chat.id, f"Часть {i}: {chunk_text}")
+                                    if bot_running:
+                                        safe_api_call(bot.send_message, message.chat.id, f"Часть {i}: {chunk_text}")
                                     
                         except sr.UnknownValueError:
-                            safe_api_call(bot.send_message, message.chat.id, f'⚠️ Часть {i}: не распознана.')
+                            if bot_running:
+                                safe_api_call(bot.send_message, message.chat.id, f'⚠️ Часть {i}: не распознана.')
                         except sr.RequestError as e:
-                            safe_api_call(bot.send_message, message.chat.id, f'⚠️ Часть {i}: ошибка сервиса.')
+                            if bot_running:
+                                safe_api_call(bot.send_message, message.chat.id, f'⚠️ Часть {i}: ошибка сервиса.')
                             logger.error(f"Ошибка сервиса распознавания: {e}")
                         except Exception as e:
-                            safe_api_call(bot.send_message, message.chat.id, f'⚠️ Часть {i}: ошибка обработки.')
+                            if bot_running:
+                                safe_api_call(bot.send_message, message.chat.id, f'⚠️ Часть {i}: ошибка обработки.')
                             logger.error(f"Ошибка распознавания части {i}: {e}")
                         finally:
                             # Удаляем обработанный чанк
@@ -278,36 +336,49 @@ def run_bot():
                                 logger.warning(f"Не удалось удалить чанк {chunk_path}: {e}")
 
                     # Итоговый результат
-                    if recognized_texts:
-                        full_text = " ".join(recognized_texts)
-                        safe_api_call(bot.send_message, message.chat.id, f'📄 Полный текст:\n\n{full_text}')
-                    else:
-                        safe_api_call(bot.send_message, message.chat.id, '😔 Речь не распознана.')
-                    
-                    safe_api_call(bot.send_message, message.chat.id, '✅ Готово!')
+                    if bot_running:
+                        if recognized_texts:
+                            full_text = " ".join(recognized_texts)
+                            safe_api_call(bot.send_message, message.chat.id, f'📄 Полный текст:\n\n{full_text}')
+                        else:
+                            safe_api_call(bot.send_message, message.chat.id, '😔 Речь не распознана.')
+                        
+                        safe_api_call(bot.send_message, message.chat.id, '✅ Готово!')
 
                 except Exception as e:
-                    safe_api_call(bot.send_message, message.chat.id, f'⚠️ Ошибка распознавания: {str(e)}')
+                    if bot_running:
+                        safe_api_call(bot.send_message, message.chat.id, f'⚠️ Ошибка распознавания: {str(e)}')
                     logger.error(f"Общая ошибка распознавания: {e}")
 
-            # Запуск бота с оптимальными настройками
+            # Запуск бота с polling в цикле для возможности прерывания
             logger.info("Бот запущен и готов к работе!")
             restart_count = 0  # Сброс при успешном запуске
             
-            bot.infinity_polling(
-                timeout=15,
-                long_polling_timeout=10,
-                logger_level=logging.WARNING,
-                restart_on_change=False,
-                allowed_updates=['message']
-            )
+            # Используем обычный polling в цикле вместо infinity_polling
+            while bot_running:
+                try:
+                    current_bot.polling(
+                        timeout=10,
+                        long_polling_timeout=5,
+                        logger_level=logging.WARNING,
+                        none_stop=False,
+                        allowed_updates=['message']
+                    )
+                except Exception as e:
+                    if bot_running:
+                        logger.warning(f"Ошибка в polling: {e}")
+                        time.sleep(2)
+                    else:
+                        break
             
         except (ReadTimeout, ConnectionError) as e:
-            restart_count += 1
-            wait_time = min(15 * restart_count, 120)  # Максимум 2 минуты
-            logger.warning(f"Ошибка соединения: {e}. Перезапуск через {wait_time}с...")
             if bot_running:
+                restart_count += 1
+                wait_time = min(15 * restart_count, 120)  # Максимум 2 минуты
+                logger.warning(f"Ошибка соединения: {e}. Перезапуск через {wait_time}с...")
                 time.sleep(wait_time)
+            else:
+                break
                 
         except KeyboardInterrupt:
             logger.info("Прерывание от пользователя")
@@ -315,17 +386,23 @@ def run_bot():
             break
             
         except Exception as e:
-            restart_count += 1
-            logger.error(f"Неожиданная ошибка: {e}")
-            if bot_running and restart_count < max_restarts:
-                wait_time = min(10 * restart_count, 60)
-                logger.info(f"Перезапуск через {wait_time}с...")
-                time.sleep(wait_time)
+            if bot_running:
+                restart_count += 1
+                logger.error(f"Неожиданная ошибка: {e}")
+                if restart_count < max_restarts:
+                    wait_time = min(10 * restart_count, 60)
+                    logger.info(f"Перезапуск через {wait_time}с...")
+                    time.sleep(wait_time)
+                else:
+                    break
+            else:
+                break
                 
         finally:
-            if bot:
+            if current_bot:
                 try:
-                    bot.stop_polling()
+                    current_bot.stop_polling()
+                    logger.info("Polling окончательно остановлен")
                 except:
                     pass
 
@@ -342,3 +419,4 @@ if __name__ == '__main__':
         logger.info("Работа бота прервана")
     finally:
         cleanup_temp_files()
+        logger.info("Программа завершена")

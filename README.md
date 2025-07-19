@@ -25,3 +25,41 @@
 2. Вставьте в него следующую строку: ```TOKEN=your_token_here```, замените your_token_here на ваш токен.
 3. Вставьте в него следующую строку: ```ALLOWED_USER_ID = 'your_user_id_here'```, замените your_user_id_here на ваш Telegram User ID (можно узнать у @getmyid_bot).
 4. ```docker compose -f "docker-compose.yml" up -d --build```
+
+## 🚀 **Дополнительные рекомендации:**
+
+Для еще большей стабильности создайте systemd service:
+
+```bash
+# Создайте файл /etc/systemd/system/telegram-bot.service
+sudo nano /etc/systemd/system/telegram-bot.service
+```
+
+```ini
+[Unit]
+Description=Telegram Voice Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/VoiceTelegramBot
+Environment=PYTHONPATH=/root/VoiceTelegramBot
+ExecStart=/root/VoiceTelegramBot/venv-python38/bin/python main.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Затем:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable telegram-bot
+sudo systemctl start telegram-bot
+```
+
+Теперь бот должен работать стабильно 24/7 без ручных перезапусков!

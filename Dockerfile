@@ -1,6 +1,6 @@
 FROM python:3.9-slim-bullseye
-RUN apt update \
-    && apt-get install --yes locales \
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends locales ffmpeg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && sed -i -e 's/# ru_RU.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/locale.gen \
@@ -14,7 +14,7 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 WORKDIR /tg_bot
 COPY . .
-RUN /usr/local/bin/python3 -m pip install --no-cache-dir --upgrade pip \ 
+RUN /usr/local/bin/python3 -m pip install --no-cache-dir --upgrade pip \
     && pip3 install --no-cache-dir -r requirements.txt \
     && rm requirements.txt
 ENV LANG=ru_RU:UTF-8

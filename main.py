@@ -11,6 +11,7 @@ from requests.exceptions import ReadTimeout, ConnectionError, HTTPError
 from telebot import apihelper
 import signal
 import sys
+from functools import wraps
 
 # Настройка системы логирования для отслеживания работы бота
 logging.basicConfig(
@@ -53,7 +54,7 @@ def signal_handler(signum, frame):
 signal.signal(signal.SIGINT, signal_handler)
 signal.signal(signal.SIGTERM, signal_handler)
 
-def safe_bot_operation(bot, operation, *args, **kwargs):
+def safe_bot_operation(operation, *args, **kwargs):
     """
     Безопасное выполнение операций с ботом с повторными попытками
     """
@@ -84,6 +85,186 @@ def cleanup_temp_files():
     except Exception as e:
         logger.warning(f"Ошибка при очистке временных файлов: {e}")
 
+def authorized_only(bot):
+    """Декоратор для проверки доступа пользователя."""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(message):
+            if message.from_user.id != ALLOWED_USER_ID:
+                safe_bot_operation(bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
+                return
+            return func(message)
+        return wrapper
+    return decorator
+
+def split_audio_file(input_file, chunk_duration=30):
+    """
+    Разбивает аудиофайл на части указанной длительности для облегчения распознавания.
+    """
+    try:
+        # Получаем длительность входного файла
+        result = subprocess.run([
+            'ffprobe',
+            '-v', 'error',
+            '-show_entries', 'format=duration',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            input_file
+        ], capture_output=True, text=True, timeout=30)
+        
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, 'ffprobe')
+            
+        audio_duration = float(result.stdout.strip())
+        
+        chunk_paths = []
+        # Разбиваем файл на куски указанной длительности
+        for start in np.arange(0, audio_duration, chunk_duration):
+            end = min(start + chunk_duration, audio_duration)
+            chunk_filename = os.path.join(
+                TEMP_AUDIO_DIR,
+                f'audio_chunk_{int(start)}_{int(time.time())}.wav'
+            )
+
+            # Используем ffmpeg для создания куска аудио
+            result = subprocess.run([
+                'ffmpeg',
+                '-i', input_file,
+                '-ss', str(start),
+                '-to', str(end),
+                '-acodec', 'pcm_s16le',
+                '-ar', '44100',
+                '-y',  # Перезаписывать файлы без подтверждения
+                chunk_filename
+            ], capture_output=True, timeout=60)
+            
+            if result.returncode == 0:
+                chunk_paths.append(chunk_filename)
+            else:
+                logger.error(f"Ошибка ffmpeg: {result.stderr.decode()}")
+
+        return chunk_paths
+        
+    except subprocess.TimeoutExpired:
+        logger.error("Таймаут при обработке аудио файла")
+        return []
+    except Exception as e:
+        logger.error(f"Ошибка при разбиении аудио файла: {e}")
+        return []
+
+def process_voice_message(bot, message):
+    """Обработка голосового сообщения в отдельном потоке"""
+    ogg_filepath = None
+    wav_filepath = None
+    
+    try:
+        safe_bot_operation(bot.reply_to, message, '⌛ Подождите немного, я обрабатываю голосовое сообщение...')
+
+        # Получение и скачивание файла
+        file_id = message.voice.file_id
+        file_info = safe_bot_operation(bot.get_file, file_id)
+        
+        if not file_info:
+            raise Exception("Не удалось получить информацию о файле")
+            
+        downloaded_file = safe_bot_operation(bot.download_file, file_info.file_path)
+        
+        # Создаем уникальные имена файлов
+        timestamp = int(time.time())
+        ogg_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{timestamp}.ogg')
+        wav_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{timestamp}.wav')
+
+        # Сохранение скачанного файла
+        with open(ogg_filepath, 'wb') as new_file:
+            new_file.write(downloaded_file)
+
+        # Конвертация из OGG в WAV с таймаутом
+        result = subprocess.run([
+            'ffmpeg',
+            '-i', ogg_filepath,
+            '-acodec', 'pcm_s16le',
+            '-ar', '44100',
+            '-y',
+            wav_filepath
+        ], capture_output=True, timeout=120)
+        
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, 'ffmpeg')
+
+        # Разбиение на части и распознавание
+        chunk_paths = split_audio_file(wav_filepath)
+        if chunk_paths:
+            process_recognition(bot, message, chunk_paths)
+        else:
+            safe_bot_operation(bot.reply_to, message, '⚠️ Не удалось обработать аудио файл.')
+
+    except subprocess.TimeoutExpired:
+        safe_bot_operation(bot.reply_to, message, '⚠️ Превышено время обработки файла.')
+        logger.error("Таймаут при конвертации аудио")
+    except Exception as e:
+        safe_bot_operation(bot.reply_to, message, f'⚠️ Извините, произошла ошибка при подготовке: {str(e)}')
+        logger.error(f"Ошибка при обработке голосового сообщения: {e}")
+    finally:
+        # Очистка временных файлов
+        for filepath in [ogg_filepath, wav_filepath]:
+            if filepath and os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить файл {filepath}: {e}")
+
+def process_recognition(bot, message, chunk_paths):
+    """Выполняет распознавание речи для каждого куска аудио."""
+    recognizer = sr.Recognizer()
+    # Настройка параметров распознавания для лучшей точности
+    recognizer.energy_threshold = 300
+    recognizer.dynamic_energy_threshold = True
+
+    try:
+        recognized_parts = []
+        # Обработка каждого куска аудио
+        for i, chunk_path in enumerate(chunk_paths, 1):
+            try:
+                with sr.AudioFile(chunk_path) as source:
+                    # Настройка для устранения шума
+                    recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                    audio_data = recognizer.record(source)
+                    
+                    # Распознавание речи с помощью Google Speech Recognition
+                    chunk_text = recognizer.recognize_google(
+                        audio_data, language='ru-RU')
+                    
+                    if chunk_text.strip():
+                        recognized_parts.append(chunk_text)
+                        
+            except sr.UnknownValueError:
+                safe_bot_operation(bot.send_message, message.chat.id, f'⚠️ Часть {i}: речь не распознана.')
+            except sr.RequestError as e:
+                safe_bot_operation(bot.send_message, message.chat.id, f'⚠️ Часть {i}: ошибка сервиса распознавания.')
+                logger.error(f"Ошибка сервиса распознавания для части {i}: {e}")
+            except Exception as e:
+                safe_bot_operation(bot.send_message, message.chat.id, f'⚠️ Часть {i}: ошибка обработки.')
+                logger.error(f"Ошибка при распознавании части {i}: {e}")
+            finally:
+                # Очистка временных файлов
+                if os.path.exists(chunk_path):
+                    try:
+                        os.remove(chunk_path)
+                    except Exception as e:
+                        logger.warning(f"Не удалось удалить чанк {chunk_path}: {e}")
+
+        # Отправляем итоговый результат
+        if recognized_parts:
+            full_text = " ".join(recognized_parts)
+            safe_bot_operation(bot.send_message, message.chat.id, f'📄 Полный текст:\n\n{full_text}')
+        else:
+            safe_bot_operation(bot.send_message, message.chat.id, '😔 К сожалению, не удалось распознать речь в аудиозаписи.')
+            
+        safe_bot_operation(bot.send_message, message.chat.id, '✅ Обработка завершена!')
+
+    except Exception as e:
+        safe_bot_operation(bot.send_message, message.chat.id, f'⚠️ Извините, произошла ошибка при распознавании: {str(e)}')
+        logger.error(f"Общая ошибка при распознавании: {e}")
+
 def run_bot():
     """
     Основная функция запуска и работы бота.
@@ -104,67 +285,10 @@ def run_bot():
             logger.info(f"Запуск бота (попытка {restart_count + 1})...")
             bot = telebot.TeleBot(token=TOKEN, threaded=True)
             
-            def split_audio_file(input_file, chunk_duration=30):
-                """
-                Разбивает аудиофайл на части указанной длительности для облегчения распознавания.
-                """
-                try:
-                    # Получаем длительность входного файла
-                    result = subprocess.run([
-                        'ffprobe',
-                        '-v', 'error',
-                        '-show_entries', 'format=duration',
-                        '-of', 'default=noprint_wrappers=1:nokey=1',
-                        input_file
-                    ], capture_output=True, text=True, timeout=30)
-                    
-                    if result.returncode != 0:
-                        raise subprocess.CalledProcessError(result.returncode, 'ffprobe')
-                        
-                    audio_duration = float(result.stdout.strip())
-                    
-                    chunk_paths = []
-                    # Разбиваем файл на куски указанной длительности
-                    for start in np.arange(0, audio_duration, chunk_duration):
-                        end = min(start + chunk_duration, audio_duration)
-                        chunk_filename = os.path.join(
-                            TEMP_AUDIO_DIR,
-                            f'audio_chunk_{int(start)}_{int(time.time())}.wav'
-                        )
-
-                        # Используем ffmpeg для создания куска аудио
-                        result = subprocess.run([
-                            'ffmpeg',
-                            '-i', input_file,
-                            '-ss', str(start),
-                            '-to', str(end),
-                            '-acodec', 'pcm_s16le',
-                            '-ar', '44100',
-                            '-y',  # Перезаписывать файлы без подтверждения
-                            chunk_filename
-                        ], capture_output=True, timeout=60)
-                        
-                        if result.returncode == 0:
-                            chunk_paths.append(chunk_filename)
-                        else:
-                            logger.error(f"Ошибка ffmpeg: {result.stderr.decode()}")
-
-                    return chunk_paths
-                    
-                except subprocess.TimeoutExpired:
-                    logger.error("Таймаут при обработке аудио файла")
-                    return []
-                except Exception as e:
-                    logger.error(f"Ошибка при разбиении аудио файла: {e}")
-                    return []
-
             @bot.message_handler(commands=['start', 'help'])
+            @authorized_only(bot)
             def send_welcome(message):
                 """Обработчик команд start и help"""
-                if message.from_user.id != ALLOWED_USER_ID:
-                    safe_bot_operation(bot, bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
-                    return
-                
                 welcome_text = """
 👋 Добро пожаловать в бот для распознавания речи!
 
@@ -172,143 +296,20 @@ def run_bot():
 📝 Поддерживается русский язык.
 ⚡ Длинные сообщения автоматически разбиваются на части.
                 """
-                safe_bot_operation(bot, bot.reply_to, message, welcome_text.strip())
+                safe_bot_operation(bot.reply_to, message, welcome_text.strip())
 
             @bot.message_handler(func=lambda message: True, content_types=['text'])
+            @authorized_only(bot)
             def text_processing(message):
                 """Обработчик текстовых сообщений."""
-                if message.from_user.id != ALLOWED_USER_ID:
-                    safe_bot_operation(bot, bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
-                    return
-
-                safe_bot_operation(bot, bot.reply_to, message, '🗣️ Запишите голосовое сообщение, либо перешлите его мне.')
+                safe_bot_operation(bot.reply_to, message, '🗣️ Запишите голосовое сообщение, либо перешлите его мне.')
 
             @bot.message_handler(content_types=['voice'])
+            @authorized_only(bot)
             def voice_processing(message):
                 """Обработчик голосовых сообщений."""
-                if message.from_user.id != ALLOWED_USER_ID:
-                    safe_bot_operation(bot, bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
-                    return
-
                 # Используем отдельный поток для обработки, чтобы не блокировать polling
                 threading.Thread(target=process_voice_message, args=(bot, message), daemon=True).start()
-
-            def process_voice_message(bot, message):
-                """Обработка голосового сообщения в отдельном потоке"""
-                ogg_filepath = None
-                wav_filepath = None
-                
-                try:
-                    safe_bot_operation(bot, bot.reply_to, message, '⌛ Подождите немного, я обрабатываю голосовое сообщение...')
-
-                    # Получение и скачивание файла
-                    file_id = message.voice.file_id
-                    file_info = safe_bot_operation(bot, bot.get_file, file_id)
-                    
-                    if not file_info:
-                        raise Exception("Не удалось получить информацию о файле")
-                        
-                    downloaded_file = safe_bot_operation(bot, bot.download_file, file_info.file_path)
-                    
-                    # Создаем уникальные имена файлов
-                    timestamp = int(time.time())
-                    ogg_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{timestamp}.ogg')
-                    wav_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{timestamp}.wav')
-
-                    # Сохранение скачанного файла
-                    with open(ogg_filepath, 'wb') as new_file:
-                        new_file.write(downloaded_file)
-
-                    # Конвертация из OGG в WAV с таймаутом
-                    result = subprocess.run([
-                        'ffmpeg',
-                        '-i', ogg_filepath,
-                        '-acodec', 'pcm_s16le',
-                        '-ar', '44100',
-                        '-y',
-                        wav_filepath
-                    ], capture_output=True, timeout=120)
-                    
-                    if result.returncode != 0:
-                        raise subprocess.CalledProcessError(result.returncode, 'ffmpeg')
-
-                    # Разбиение на части и распознавание
-                    chunk_paths = split_audio_file(wav_filepath)
-                    if chunk_paths:
-                        process_recognition(bot, message, chunk_paths)
-                    else:
-                        safe_bot_operation(bot, bot.reply_to, message, '⚠️ Не удалось обработать аудио файл.')
-
-                except subprocess.TimeoutExpired:
-                    safe_bot_operation(bot, bot.reply_to, message, '⚠️ Превышено время обработки файла.')
-                    logger.error("Таймаут при конвертации аудио")
-                except Exception as e:
-                    safe_bot_operation(bot, bot.reply_to, message, f'⚠️ Извините, произошла ошибка при подготовке: {str(e)}')
-                    logger.error(f"Ошибка при обработке голосового сообщения: {e}")
-                finally:
-                    # Очистка временных файлов
-                    for filepath in [ogg_filepath, wav_filepath]:
-                        if filepath and os.path.exists(filepath):
-                            try:
-                                os.remove(filepath)
-                            except Exception as e:
-                                logger.warning(f"Не удалось удалить файл {filepath}: {e}")
-
-            def process_recognition(bot, message, chunk_paths):
-                """Выполняет распознавание речи для каждого куска аудио."""
-                recognizer = sr.Recognizer()
-                # Настройка параметров распознавания для лучшей точности
-                recognizer.energy_threshold = 300
-                recognizer.dynamic_energy_threshold = True
-
-                try:
-                    safe_bot_operation(bot, bot.send_message, message.chat.id, '📝 Начинаю распознавание...')
-
-                    recognized_parts = []
-                    # Обработка каждого куска аудио
-                    for i, chunk_path in enumerate(chunk_paths, 1):
-                        try:
-                            with sr.AudioFile(chunk_path) as source:
-                                # Настройка для устранения шума
-                                recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                                audio_data = recognizer.record(source)
-                                
-                                # Распознавание речи с помощью Google Speech Recognition
-                                chunk_text = recognizer.recognize_google(
-                                    audio_data, language='ru-RU')
-                                
-                                if chunk_text.strip():
-                                    recognized_parts.append(chunk_text)
-                                    safe_bot_operation(bot, bot.send_message, message.chat.id, f"Часть {i}: {chunk_text}")
-                                    
-                        except sr.UnknownValueError:
-                            safe_bot_operation(bot, bot.send_message, message.chat.id, f'⚠️ Часть {i}: речь не распознана.')
-                        except sr.RequestError as e:
-                            safe_bot_operation(bot, bot.send_message, message.chat.id, f'⚠️ Часть {i}: ошибка сервиса распознавания.')
-                            logger.error(f"Ошибка сервиса распознавания для части {i}: {e}")
-                        except Exception as e:
-                            safe_bot_operation(bot, bot.send_message, message.chat.id, f'⚠️ Часть {i}: ошибка обработки.')
-                            logger.error(f"Ошибка при распознавании части {i}: {e}")
-                        finally:
-                            # Очистка временных файлов
-                            if os.path.exists(chunk_path):
-                                try:
-                                    os.remove(chunk_path)
-                                except Exception as e:
-                                    logger.warning(f"Не удалось удалить чанк {chunk_path}: {e}")
-
-                    # Отправляем итоговый результат
-                    if recognized_parts:
-                        full_text = " ".join(recognized_parts)
-                        safe_bot_operation(bot, bot.send_message, message.chat.id, f'📄 Полный текст:\n\n{full_text}')
-                    else:
-                        safe_bot_operation(bot, bot.send_message, message.chat.id, '😔 К сожалению, не удалось распознать речь в аудиозаписи.')
-                        
-                    safe_bot_operation(bot, bot.send_message, message.chat.id, '✅ Обработка завершена!')
-
-                except Exception as e:
-                    safe_bot_operation(bot, bot.send_message, message.chat.id, f'⚠️ Извините, произошла ошибка при распознавании: {str(e)}')
-                    logger.error(f"Общая ошибка при распознавании: {e}")
 
             # Запуск polling с оптимизированными параметрами
             logger.info("Бот успешно запущен и готов к работе!")

@@ -1,12 +1,11 @@
 import telebot
 import speech_recognition as sr
 import os
-import numpy as np
 import subprocess
 import time
+import uuid
 import logging
 import threading
-from telebot.handler_backends import State
 from requests.exceptions import ReadTimeout, ConnectionError, HTTPError
 from telebot import apihelper
 import signal
@@ -125,11 +124,12 @@ def run_bot():
                     
                     chunk_paths = []
                     # Разбиваем файл на куски указанной длительности
-                    for start in np.arange(0, audio_duration, chunk_duration):
+                    start = 0.0
+                    while start < audio_duration:
                         end = min(start + chunk_duration, audio_duration)
                         chunk_filename = os.path.join(
                             TEMP_AUDIO_DIR,
-                            f'audio_chunk_{int(start)}_{int(time.time())}.wav'
+                            f'audio_chunk_{int(start)}_{uuid.uuid4().hex}.wav'
                         )
 
                         # Используем ffmpeg для создания куска аудио
@@ -148,6 +148,7 @@ def run_bot():
                             chunk_paths.append(chunk_filename)
                         else:
                             logger.error(f"Ошибка ffmpeg: {result.stderr.decode()}")
+                        start += chunk_duration
 
                     return chunk_paths
                     
@@ -211,9 +212,9 @@ def run_bot():
                     downloaded_file = safe_bot_operation(bot, bot.download_file, file_info.file_path)
                     
                     # Создаем уникальные имена файлов
-                    timestamp = int(time.time())
-                    ogg_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{timestamp}.ogg')
-                    wav_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{timestamp}.wav')
+                    unique_id = uuid.uuid4().hex
+                    ogg_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{unique_id}.ogg')
+                    wav_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{unique_id}.wav')
 
                     # Сохранение скачанного файла
                     with open(ogg_filepath, 'wb') as new_file:

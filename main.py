@@ -169,6 +169,8 @@ def run_bot():
 👋 Добро пожаловать в бот для распознавания речи!
 
 🗣️ Отправьте мне голосовое сообщение, и я преобразую его в текст.
+🟣 Также поддерживаются видео-кружки (video notes).
+🎥 И обычные видео — я извлеку из них аудио и распознаю речь.
 📝 Поддерживается русский язык.
 ⚡ Длинные сообщения автоматически разбиваются на части.
                 """
@@ -181,7 +183,7 @@ def run_bot():
                     safe_bot_operation(bot, bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
                     return
 
-                safe_bot_operation(bot, bot.reply_to, message, '🗣️ Запишите голосовое сообщение, либо перешлите его мне.')
+                safe_bot_operation(bot, bot.reply_to, message, '🗣️ Запишите голосовое сообщение, видео-кружок или отправьте видео, либо перешлите их мне.')
 
             @bot.message_handler(content_types=['voice'])
             def voice_processing(message):
@@ -193,33 +195,29 @@ def run_bot():
                 # Используем отдельный поток для обработки, чтобы не блокировать polling
                 threading.Thread(target=process_voice_message, args=(bot, message), daemon=True).start()
 
-            def process_voice_message(bot, message):
-                """Обработка голосового сообщения в отдельном потоке"""
-                ogg_filepath = None
-                wav_filepath = None
-                
-                try:
-                    safe_bot_operation(bot, bot.reply_to, message, '⌛ Подождите немного, я обрабатываю голосовое сообщение...')
+            @bot.message_handler(content_types=['video_note'])
+            def video_note_processing(message):
+                """Обработчик видео-кружков (video_note)."""
+                if message.from_user.id != ALLOWED_USER_ID:
+                    safe_bot_operation(bot, bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
+                    return
+                threading.Thread(target=process_video_note_message, args=(bot, message), daemon=True).start()
 
-                    # Получение и скачивание файла
-                    file_id = message.voice.file_id
-                    file_info = safe_bot_operation(bot, bot.get_file, file_id)
-                    
-                    if not file_info:
-                        raise Exception("Не удалось получить информацию о файле")
-                        
-                    downloaded_file = safe_bot_operation(bot, bot.download_file, file_info.file_path)
-                    
-                    # Создаем уникальные имена файлов
+            @bot.message_handler(content_types=['video'])
+            def video_processing(message):
+                """Обработчик видео сообщений."""
+                if message.from_user.id != ALLOWED_USER_ID:
+                    safe_bot_operation(bot, bot.reply_to, message, '🚫 Доступ запрещен. Извините.')
+                    return
+                threading.Thread(target=process_video_message, args=(bot, message), daemon=True).start()
+
+            def _process_ogg_to_text(bot, message, ogg_filepath):
+                """Конвертация OGG в WAV и распознавание речи. Вспомогательная функция."""
+                wav_filepath = None
+                try:
                     timestamp = int(time.time())
-                    ogg_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{timestamp}.ogg')
                     wav_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{timestamp}.wav')
 
-                    # Сохранение скачанного файла
-                    with open(ogg_filepath, 'wb') as new_file:
-                        new_file.write(downloaded_file)
-
-                    # Конвертация из OGG в WAV с таймаутом
                     result = subprocess.run([
                         'ffmpeg',
                         '-i', ogg_filepath,
@@ -228,16 +226,47 @@ def run_bot():
                         '-y',
                         wav_filepath
                     ], capture_output=True, timeout=120)
-                    
+
                     if result.returncode != 0:
                         raise subprocess.CalledProcessError(result.returncode, 'ffmpeg')
 
-                    # Разбиение на части и распознавание
                     chunk_paths = split_audio_file(wav_filepath)
                     if chunk_paths:
                         process_recognition(bot, message, chunk_paths)
                     else:
                         safe_bot_operation(bot, bot.reply_to, message, '⚠️ Не удалось обработать аудио файл.')
+                finally:
+                    if wav_filepath and os.path.exists(wav_filepath):
+                        try:
+                            os.remove(wav_filepath)
+                        except Exception as e:
+                            logger.warning(f"Не удалось удалить файл {wav_filepath}: {e}")
+
+            def process_voice_message(bot, message):
+                """Обработка голосового сообщения в отдельном потоке"""
+                ogg_filepath = None
+
+                try:
+                    safe_bot_operation(bot, bot.reply_to, message, '⌛ Подождите немного, я обрабатываю голосовое сообщение...')
+
+                    # Получение и скачивание файла
+                    file_id = message.voice.file_id
+                    file_info = safe_bot_operation(bot, bot.get_file, file_id)
+
+                    if not file_info:
+                        raise Exception("Не удалось получить информацию о файле")
+
+                    downloaded_file = safe_bot_operation(bot, bot.download_file, file_info.file_path)
+
+                    # Создаем уникальные имена файлов
+                    timestamp = int(time.time())
+                    ogg_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{timestamp}.ogg')
+
+                    # Сохранение скачанного файла
+                    with open(ogg_filepath, 'wb') as new_file:
+                        new_file.write(downloaded_file)
+
+                    _process_ogg_to_text(bot, message, ogg_filepath)
 
                 except subprocess.TimeoutExpired:
                     safe_bot_operation(bot, bot.reply_to, message, '⚠️ Превышено время обработки файла.')
@@ -247,7 +276,70 @@ def run_bot():
                     logger.error(f"Ошибка при обработке голосового сообщения: {e}")
                 finally:
                     # Очистка временных файлов
-                    for filepath in [ogg_filepath, wav_filepath]:
+                    if ogg_filepath and os.path.exists(ogg_filepath):
+                        try:
+                            os.remove(ogg_filepath)
+                        except Exception as e:
+                            logger.warning(f"Не удалось удалить файл {ogg_filepath}: {e}")
+
+            def process_video_note_message(bot, message):
+                """Обработка видео-кружка в отдельном потоке"""
+                _process_video_file(bot, message, message.video_note.file_id,
+                                    '⌛ Подождите немного, я обрабатываю видео-кружок...', 'видео-кружка')
+
+            def process_video_message(bot, message):
+                """Обработка видео в отдельном потоке"""
+                _process_video_file(bot, message, message.video.file_id,
+                                    '⌛ Подождите немного, я обрабатываю видео...', 'видео')
+
+            def _process_video_file(bot, message, file_id, wait_message, log_prefix):
+                """Скачивание видеофайла, извлечение аудио и распознавание речи. Вспомогательная функция."""
+                mp4_filepath = None
+                ogg_filepath = None
+
+                try:
+                    safe_bot_operation(bot, bot.reply_to, message, wait_message)
+
+                    file_info = safe_bot_operation(bot, bot.get_file, file_id)
+
+                    if not file_info:
+                        raise Exception("Не удалось получить информацию о файле")
+
+                    downloaded_file = safe_bot_operation(bot, bot.download_file, file_info.file_path)
+
+                    # Создаем уникальные имена файлов
+                    timestamp = int(time.time())
+                    mp4_filepath = os.path.join(TEMP_AUDIO_DIR, f'video_{timestamp}.mp4')
+                    ogg_filepath = os.path.join(TEMP_AUDIO_DIR, f'audio_{timestamp}.ogg')
+
+                    # Сохранение скачанного файла
+                    with open(mp4_filepath, 'wb') as new_file:
+                        new_file.write(downloaded_file)
+
+                    # Извлечение аудиодорожки из mp4
+                    result = subprocess.run([
+                        'ffmpeg',
+                        '-i', mp4_filepath,
+                        '-vn',
+                        '-acodec', 'libopus',
+                        '-y',
+                        ogg_filepath
+                    ], capture_output=True, timeout=120)
+
+                    if result.returncode != 0:
+                        raise subprocess.CalledProcessError(result.returncode, 'ffmpeg')
+
+                    _process_ogg_to_text(bot, message, ogg_filepath)
+
+                except subprocess.TimeoutExpired:
+                    safe_bot_operation(bot, bot.reply_to, message, '⚠️ Превышено время обработки файла.')
+                    logger.error(f"Таймаут при конвертации {log_prefix}")
+                except Exception as e:
+                    safe_bot_operation(bot, bot.reply_to, message, f'⚠️ Извините, произошла ошибка при подготовке: {str(e)}')
+                    logger.error(f"Ошибка при обработке {log_prefix}: {e}")
+                finally:
+                    # Очистка временных файлов
+                    for filepath in [mp4_filepath, ogg_filepath]:
                         if filepath and os.path.exists(filepath):
                             try:
                                 os.remove(filepath)

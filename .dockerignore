@@ -1,0 +1,13 @@
+.git
+.gitignore
+*.log
+bot.log
+temp_audio/
+.env
+config.py
+__pycache__/
+*.pyc
+*.pyo
+.DS_Store
+README.md
+LICENSE

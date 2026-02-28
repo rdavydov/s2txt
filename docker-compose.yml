@@ -7,6 +7,6 @@ services:
     image: s2txt:latest
     init: true
     environment:
-      - PYTHONUNBUFFERED=0
+      - PYTHONUNBUFFERED=1
       - TOKEN=${TOKEN}
       - ALLOWED_USER_ID=${ALLOWED_USER_ID}

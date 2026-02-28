@@ -1,6 +1,6 @@
 FROM python:3.9-slim-bullseye
 RUN apt update \
-    && apt-get install --yes locales \
+    && apt-get install --yes locales ffmpeg \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/* \
     && sed -i -e 's/# ru_RU.UTF-8 UTF-8/ru_RU.UTF-8 UTF-8/' /etc/locale.gen \

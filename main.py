@@ -1,12 +1,11 @@
 import telebot
 import speech_recognition as sr
 import os
-import numpy as np
 import subprocess
 import time
 import logging
 import threading
-from telebot.handler_backends import State
+from logging.handlers import RotatingFileHandler
 from requests.exceptions import ReadTimeout, ConnectionError, HTTPError
 from telebot import apihelper
 import signal
@@ -17,7 +16,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('bot.log'),  # Сохранение логов в файл
+        RotatingFileHandler('bot.log', maxBytes=5 * 1024 * 1024, backupCount=3),  # 5 MB, 3 файла
         logging.StreamHandler()          # Вывод логов в консоль
     ]
 )
@@ -125,7 +124,8 @@ def run_bot():
                     
                     chunk_paths = []
                     # Разбиваем файл на куски указанной длительности
-                    for start in np.arange(0, audio_duration, chunk_duration):
+                    start = 0.0
+                    while start < audio_duration:
                         end = min(start + chunk_duration, audio_duration)
                         chunk_filename = os.path.join(
                             TEMP_AUDIO_DIR,
@@ -148,6 +148,7 @@ def run_bot():
                             chunk_paths.append(chunk_filename)
                         else:
                             logger.error(f"Ошибка ffmpeg: {result.stderr.decode()}")
+                        start += chunk_duration
 
                     return chunk_paths
                     
@@ -404,6 +405,7 @@ def run_bot():
 
             # Запуск polling с оптимизированными параметрами
             logger.info("Бот успешно запущен и готов к работе!")
+            polling_start = time.time()
             bot.infinity_polling(
                 timeout=20,           # Таймаут для получения обновлений
                 long_polling_timeout=15,  # Таймаут для long polling
@@ -411,6 +413,10 @@ def run_bot():
                 restart_on_change=False,
                 allowed_updates=['message']  # Обрабатываем только сообщения
             )
+            # Сброс счётчика при успешной работе более 10 минут
+            if time.time() - polling_start > 600:
+                logger.info("Стабильная работа более 10 минут, сбрасываем счётчик перезапусков.")
+                restart_count = 0
             
         except (ReadTimeout, ConnectionError) as e:
             restart_count += 1
@@ -433,12 +439,8 @@ def run_bot():
             if bot and hasattr(bot, 'stop_polling'):
                 try:
                     bot.stop_polling()
-                except:
-                    pass
-            
-            # Сброс счетчика при успешной работе более 10 минут
-            if restart_count > 0:
-                time.sleep(1)
+                except Exception as e:
+                    logger.warning(f"Ошибка при остановке polling: {e}")
     
     if restart_count >= max_restarts:
         logger.error(f"Достигнуто максимальное количество перезапусков ({max_restarts}). Завершение работы.")
